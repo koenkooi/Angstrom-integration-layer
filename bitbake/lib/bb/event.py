@@ -88,7 +88,7 @@ def fire_class_handlers(event, d):
     for name, handler in _handlers.iteritems():
         try:
             execute_handler(name, handler, event, d)
-        except BaseException:
+        except Exception:
             continue
 
 ui_queue = []
@@ -120,7 +120,10 @@ def fire_ui_handlers(event, d):
              # We use pickle here since it better handles object instances
              # which xmlrpc's marshaller does not. Events *must* be serializable
              # by pickle.
-            _ui_handlers[h].event.send(event)
+             if hasattr(_ui_handlers[h].event, "sendpickle"):
+                _ui_handlers[h].event.sendpickle((pickle.dumps(event)))
+             else:
+                _ui_handlers[h].event.send(event)
         except:
             errors.append(h)
     for h in errors:
@@ -203,12 +206,16 @@ def getName(e):
 class ConfigParsed(Event):
     """Configuration Parsing Complete"""
 
-class RecipeParsed(Event):
-    """ Recipe Parsing Complete """
-
+class RecipeEvent(Event):
     def __init__(self, fn):
         self.fn = fn
         Event.__init__(self)
+
+class RecipePreFinalise(RecipeEvent):
+    """ Recipe Parsing Complete but not yet finialised"""
+
+class RecipeParsed(RecipeEvent):
+    """ Recipe Parsing Complete """
 
 class StampUpdate(Event):
     """Trigger for any adjustment of the stamp files to happen"""
@@ -422,8 +429,10 @@ class LogHandler(logging.Handler):
 
     def emit(self, record):
         if record.exc_info:
-            lines = traceback.format_exception(*record.exc_info, limit=5)
-            record.msg += '\n%s' % ''.join(lines)
+            etype, value, tb = record.exc_info
+            if hasattr(tb, 'tb_next'):
+                tb = list(bb.exceptions.extract_traceback(tb, context=3))
+            record.bb_exc_info = (etype, value, tb)
             record.exc_info = None
         fire(record, None)
 

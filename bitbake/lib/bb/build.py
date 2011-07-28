@@ -187,11 +187,11 @@ def exec_func_python(func, d, runfile, cwd=None):
         script.write(code)
 
     if cwd:
-        os.chdir(cwd)
         try:
             olddir = os.getcwd()
         except OSError:
             olddir = None
+        os.chdir(cwd)
 
     try:
         comp = utils.better_compile(code, func, bbfile)
@@ -257,7 +257,7 @@ def _task_data(fn, task, d):
     data.expandKeys(localdata)
     return localdata
 
-def _exec_task(fn, task, d):
+def _exec_task(fn, task, d, quieterr):
     """Execute a BB 'task'
 
     Execution of a task involves a bit more setup than executing a function,
@@ -322,8 +322,9 @@ def _exec_task(fn, task, d):
         for func in (postfuncs or '').split():
             exec_func(func, localdata)
     except FuncFailed as exc:
-        logger.error(str(exc))
-        event.fire(TaskFailed(task, logfn, localdata), localdata)
+        if not quieterr:
+            logger.error(str(exc))
+            event.fire(TaskFailed(task, logfn, localdata), localdata)
         return 1
     finally:
         sys.stdout.flush()
@@ -356,13 +357,18 @@ def _exec_task(fn, task, d):
 
 def exec_task(fn, task, d):
     try: 
-        return _exec_task(fn, task, d)
+        quieterr = False
+        if d.getVarFlag(task, "quieterrors") is not None:
+            quieterr = True
+
+        return _exec_task(fn, task, d, quieterr)
     except Exception:
         from traceback import format_exc
-        logger.error("Build of %s failed" % (task))
-        logger.error(format_exc())
-        failedevent = TaskFailed(task, None, d)
-        event.fire(failedevent, d)
+        if not quieterr:
+            logger.error("Build of %s failed" % (task))
+            logger.error(format_exc())
+            failedevent = TaskFailed(task, None, d)
+            event.fire(failedevent, d)
         return 1
 
 def stamp_internal(taskname, d, file_name):
@@ -407,6 +413,12 @@ def make_stamp(task, d, file_name = None):
         bb.utils.remove(stamp)
         f = open(stamp, "w")
         f.close()
+
+    # If we're in task context, write out a signature file for each task
+    # as it completes
+    if not task.endswith("_setscene") and task != "do_setscene" and not file_name:
+        file_name = d.getVar('BB_FILENAME', True)
+        bb.parse.siggen.dump_sigtask(file_name, task, d.getVar('STAMP', True), True)
 
 def del_stamp(task, d, file_name = None):
     """

@@ -33,7 +33,7 @@ import threading
 from cStringIO import StringIO
 from contextlib import closing
 from functools import wraps
-import bb
+import bb, bb.exceptions
 from bb import utils, data, parse, event, cache, providers, taskdata, command, runqueue
 
 logger      = logging.getLogger("BitBake")
@@ -55,6 +55,20 @@ class NothingToBuild(Exception):
 class state:
     initial, parsing, running, shutdown, stop = range(5)
 
+
+class SkippedPackage:
+    def __init__(self, info = None, reason = None):
+        self.skipreason = None
+        self.provides = None
+        self.rprovides = None
+
+        if info:
+            self.skipreason = info.skipreason
+            self.provides = info.provides
+            self.rprovides = info.rprovides
+        elif reason:
+            self.skipreason = reason
+
 #============================================================================#
 # BBCooker
 #============================================================================#
@@ -66,16 +80,58 @@ class BBCooker:
     def __init__(self, configuration, server_registration_cb):
         self.status = None
         self.appendlist = {}
+        self.skiplist = {}
 
         self.server_registration_cb = server_registration_cb
 
         self.configuration = configuration
 
+        self.caches_array = []
+        # Currently, only Image Creator hob ui needs extra cache.
+        # So, we save Extra Cache class name and container file
+        # information into a extraCaches field in hob UI.  
+        # TODO: In future, bin/bitbake should pass information into cooker,
+        # instead of getting information from configuration.ui. Also, some
+        # UI start up issues need to be addressed at the same time.
+        caches_name_array = ['bb.cache:CoreRecipeInfo']
+        if configuration.ui:
+            try:
+                module = __import__('bb.ui', fromlist=[configuration.ui])
+                name_array = (getattr(module, configuration.ui)).extraCaches
+                for recipeInfoName in name_array:
+                    caches_name_array.append(recipeInfoName)
+            except ImportError, exc:
+                # bb.ui.XXX is not defined and imported. It's an error!
+                logger.critical("Unable to import '%s' interface from bb.ui: %s" % (configuration.ui, exc))
+                sys.exit("FATAL: Failed to import '%s' interface." % configuration.ui)
+            except AttributeError:
+                # This is not an error. If the field is not defined in the ui,
+                # this interface might need no extra cache fields, so
+                # just skip this error!
+                logger.debug(2, "UI '%s' does not require extra cache!" % (configuration.ui))
+
+        # At least CoreRecipeInfo will be loaded, so caches_array will never be empty!
+        # This is the entry point, no further check needed!
+        for var in caches_name_array:
+            try:
+                module_name, cache_name = var.split(':')
+                module = __import__(module_name, fromlist=(cache_name,))
+                self.caches_array.append(getattr(module, cache_name)) 
+            except ImportError, exc:
+                logger.critical("Unable to import extra RecipeInfo '%s' from '%s': %s" % (cache_name, module_name, exc))
+                sys.exit("FATAL: Failed to import extra cache class '%s'." % cache_name)
+
         self.configuration.data = bb.data.init()
 
         bb.data.inheritFromOS(self.configuration.data)
 
-        self.parseConfigurationFiles(self.configuration.file)
+        try:
+            self.parseConfigurationFiles(self.configuration.file)
+        except SyntaxError:
+            sys.exit(1)
+        except Exception:
+            logger.exception("Error parsing configuration files")
+            sys.exit(1)
 
         if not self.configuration.cmd:
             self.configuration.cmd = bb.data.getVar("BB_DEFAULT_TASK", self.configuration.data, True) or "build"
@@ -83,8 +139,6 @@ class BBCooker:
         bbpkgs = bb.data.getVar('BBPKGS', self.configuration.data, True)
         if bbpkgs and len(self.configuration.pkgs_to_build) == 0:
             self.configuration.pkgs_to_build.extend(bbpkgs.split())
-
-        self.parseCommandLine()
 
         #
         # Special updated configuration we use for firing events
@@ -124,6 +178,8 @@ class BBCooker:
 
             if 'world' in self.configuration.pkgs_to_build:
                 buildlog.error("'world' is not a valid target for --environment.")
+            if 'universe' in self.configuration.pkgs_to_build:
+                buildlog.error("'universe' is not a valid target for --environment.")
             elif len(self.configuration.pkgs_to_build) > 1:
                 buildlog.error("Only one target can be used with the --environment option.")
             elif self.configuration.buildfile and len(self.configuration.pkgs_to_build) > 0:
@@ -253,7 +309,9 @@ class BBCooker:
         localdata = data.createCopy(self.configuration.data)
         bb.data.update_data(localdata)
         bb.data.expandKeys(localdata)
-        taskdata = bb.taskdata.TaskData(self.configuration.abort)
+        # We set abort to False here to prevent unbuildable targets raising
+        # an exception when we're just generating data
+        taskdata = bb.taskdata.TaskData(False)
 
         runlist = []
         for k in pkgs_to_build:
@@ -401,6 +459,15 @@ class BBCooker:
         print("}", file=tdepends_file)
         logger.info("Task dependencies saved to 'task-depends.dot'")
 
+    def calc_bbfile_priority( self, filename, matched = None ):
+        for _, _, regex, pri in self.status.bbfile_config_priorities:
+            if regex.match(filename):
+                if matched != None:
+                    if not regex in matched:
+                        matched.add(regex)
+                return pri
+        return 0
+
     def buildDepgraph( self ):
         all_depends = self.status.all_depends
         pn_provides = self.status.pn_provides
@@ -408,15 +475,6 @@ class BBCooker:
         localdata = data.createCopy(self.configuration.data)
         bb.data.update_data(localdata)
         bb.data.expandKeys(localdata)
-
-        matched = set()
-        def calc_bbfile_priority(filename):
-            for _, _, regex, pri in self.status.bbfile_config_priorities:
-                if regex.match(filename):
-                    if not regex in matched:
-                        matched.add(regex)
-                    return pri
-            return 0
 
         # Handle PREFERRED_PROVIDERS
         for p in (bb.data.getVar('PREFERRED_PROVIDERS', localdata, 1) or "").split():
@@ -430,11 +488,29 @@ class BBCooker:
             self.status.preferred[providee] = provider
 
         # Calculate priorities for each file
+        matched = set()
         for p in self.status.pkg_fn:
-            self.status.bbfile_priority[p] = calc_bbfile_priority(p)
+            self.status.bbfile_priority[p] = self.calc_bbfile_priority(p, matched)
+ 
+        # Don't show the warning if the BBFILE_PATTERN did match .bbappend files
+        unmatched = set()
+        for _, _, regex, pri in self.status.bbfile_config_priorities:        
+            if not regex in matched:
+                unmatched.add(regex)
+
+        def findmatch(regex):
+            for bbfile in self.appendlist:
+                for append in self.appendlist[bbfile]:
+                    if regex.match(append):
+                        return True
+            return False
+
+        for unmatch in unmatched.copy():
+            if findmatch(unmatch):
+                unmatched.remove(unmatch)
 
         for collection, pattern, regex, _ in self.status.bbfile_config_priorities:
-            if not regex in matched:
+            if regex in unmatched:
                 collectlog.warn("No bb files matched BBFILE_PATTERN_%s '%s'" % (collection, pattern))
 
     def findConfigFiles(self, varname):
@@ -649,22 +725,22 @@ class BBCooker:
             bb.data.setVar("BUILDNAME", time.strftime('%Y%m%d%H%M'), self.configuration.data)
         bb.data.setVar("BUILDSTART", time.strftime('%m/%d/%Y %H:%M:%S', time.gmtime()), self.configuration.data)
 
-    def matchFiles(self, buildfile):
+    def matchFiles(self, bf):
         """
         Find the .bb files which match the expression in 'buildfile'.
         """
 
-        bf = os.path.abspath(buildfile)
+        if bf.startswith("/") or bf.startswith("../"):
+            bf = os.path.abspath(bf)
         filelist, masked = self.collect_bbfiles()
         try:
             os.stat(bf)
             return [bf]
         except OSError:
-            regexp = re.compile(buildfile)
+            regexp = re.compile(bf)
             matches = []
             for f in filelist:
                 if regexp.search(f) and os.path.isfile(f):
-                    bf = f
                     matches.append(f)
             return matches
 
@@ -695,25 +771,25 @@ class BBCooker:
             task = self.configuration.cmd
 
         fn, cls = bb.cache.Cache.virtualfn2realfn(buildfile)
-        fn = os.path.abspath(fn)
-        buildfile = self.matchFile(fn)
+        fn = self.matchFile(fn)
 
         self.buildSetVars()
 
-        self.status = bb.cache.CacheData()
+        self.status = bb.cache.CacheData(self.caches_array)
         infos = bb.cache.Cache.parse(fn, self.get_file_appends(fn), \
-                                     self.configuration.data)
+                                     self.configuration.data,
+                                     self.caches_array)
         infos = dict(infos)
 
-        fn = bb.cache.Cache.realfn2virtual(buildfile, cls)
+        fn = bb.cache.Cache.realfn2virtual(fn, cls)
         try:
-            maininfo = infos[fn]
+            info_array = infos[fn]
         except KeyError:
             bb.fatal("%s does not exist" % fn)
-        self.status.add_from_recipeinfo(fn, maininfo)
+        self.status.add_from_recipeinfo(fn, info_array)
 
         # Tweak some variables
-        item = maininfo.pn
+        item = info_array[0].pn
         self.status.ignored_dependencies = set()
         self.status.bbfile_priority[fn] = 1
 
@@ -764,7 +840,7 @@ class BBCooker:
                 return False
             if retval is True:
                 return True
-            return 0.5
+            return retval
 
         self.server_registration_cb(buildFileIdle, rq)
 
@@ -805,7 +881,7 @@ class BBCooker:
                 return False
             if retval is True:
                 return True
-            return 0.5
+            return retval
 
         self.buildSetVars()
 
@@ -839,20 +915,7 @@ class BBCooker:
         if self.state != state.parsing:
             self.parseConfiguration ()
 
-            # Import Psyco if available and not disabled
-            import platform
-            if platform.machine() in ['i386', 'i486', 'i586', 'i686']:
-                if not self.configuration.disable_psyco:
-                    try:
-                        import psyco
-                    except ImportError:
-                        collectlog.info("Psyco JIT Compiler (http://psyco.sf.net) not available. Install it to increase performance.")
-                    else:
-                        psyco.bind( CookerParser.parse_next )
-                else:
-                    collectlog.info("You have disabled Psyco. This decreases performance.")
-
-            self.status = bb.cache.CacheData()
+            self.status = bb.cache.CacheData(self.caches_array)
 
             ignore = bb.data.getVar("ASSUME_PROVIDED", self.configuration.data, 1) or ""
             self.status.ignored_dependencies = set(ignore.split())
@@ -885,6 +948,12 @@ class BBCooker:
             self.buildWorldTargetList()
             pkgs_to_build.remove('world')
             for t in self.status.world_target:
+                pkgs_to_build.append(t)
+
+        if 'universe' in pkgs_to_build:
+            parselog.debug(1, "collating packages for \"universe\"")
+            pkgs_to_build.remove('universe')
+            for t in self.status.universe_target:
                 pkgs_to_build.append(t)
 
         return pkgs_to_build
@@ -921,6 +990,9 @@ class BBCooker:
         files = (data.getVar( "BBFILES", self.configuration.data, 1 ) or "").split()
         data.setVar("BBFILES", " ".join(files), self.configuration.data)
 
+        # Sort files by priority
+        files.sort( key=lambda fileitem: self.calc_bbfile_priority(fileitem) )
+
         if not len(files):
             files = self.get_bbfiles()
 
@@ -928,16 +1000,21 @@ class BBCooker:
             collectlog.error("no recipe files to build, check your BBPATH and BBFILES?")
             bb.event.fire(CookerExit(), self.configuration.event_data)
 
-        newfiles = set()
+        # Can't use set here as order is important
+        newfiles = []
         for f in files:
             if os.path.isdir(f):
                 dirfiles = self.find_bbfiles(f)
-                newfiles.update(dirfiles)
+                for g in dirfiles:
+                    if g not in newfiles:
+                        newfiles.append(g)
             else:
                 globbed = glob.glob(f)
                 if not globbed and os.path.exists(f):
                     globbed = [f]
-                newfiles.update(globbed)
+                for g in globbed:
+                    if g not in newfiles:
+                        newfiles.append(g)
 
         bbmask = bb.data.getVar('BBMASK', self.configuration.data, 1)
 
@@ -981,11 +1058,61 @@ class BBCooker:
             return self.appendlist[f]
         return []
 
+    def pre_serve(self):
+        # Empty the environment. The environment will be populated as
+        # necessary from the data store.
+        #bb.utils.empty_environment()
+        return
+
+    def post_serve(self):
+        bb.event.fire(CookerExit(), self.configuration.event_data)
+
     def shutdown(self):
         self.state = state.shutdown
 
     def stop(self):
         self.state = state.stop
+
+def server_main(cooker, func, *args):
+    cooker.pre_serve()
+
+    if cooker.configuration.profile:
+        try:
+            import cProfile as profile
+        except:
+            import profile
+        prof = profile.Profile()
+
+        ret = profile.Profile.runcall(prof, func, *args)
+
+        prof.dump_stats("profile.log")
+
+        # Redirect stdout to capture profile information
+        pout = open('profile.log.processed', 'w')
+        so = sys.stdout.fileno()
+        orig_so = os.dup(sys.stdout.fileno())
+        os.dup2(pout.fileno(), so)
+   
+        import pstats
+        p = pstats.Stats('profile.log')
+        p.sort_stats('time')
+        p.print_stats()
+        p.print_callers()
+        p.sort_stats('cumulative')
+        p.print_stats()
+
+        os.dup2(orig_so, so)
+        pout.flush()
+        pout.close()  
+
+        print("Raw profiling information saved to profile.log and processed statistics to profile.log.processed")
+
+    else:
+        ret = func(*args)
+
+    cooker.post_serve()
+
+    return ret
 
 class CookerExit(bb.event.Event):
     """
@@ -1001,7 +1128,7 @@ def catch_parse_error(func):
     def wrapped(fn, *args):
         try:
             return func(fn, *args)
-        except (IOError, bb.parse.ParseError) as exc:
+        except (IOError, bb.parse.ParseError, bb.data_smart.ExpansionError) as exc:
             parselog.critical("Unable to parse %s: %s" % (fn, exc))
             sys.exit(1)
     return wrapped
@@ -1019,15 +1146,16 @@ class ParsingFailure(Exception):
     def __init__(self, realexception, recipe):
         self.realexception = realexception
         self.recipe = recipe
-        Exception.__init__(self, "Failure when parsing %s" % recipe)
-        self.args = (realexception, recipe)
+        Exception.__init__(self, realexception, recipe)
 
 def parse_file(task):
-    filename, appends = task
+    filename, appends, caches_array = task
     try:
-        return True, bb.cache.Cache.parse(filename, appends, parse_file.cfg)
+        return True, bb.cache.Cache.parse(filename, appends, parse_file.cfg, caches_array)
     except Exception, exc:
+        tb = sys.exc_info()[2]
         exc.recipe = filename
+        exc.traceback = list(bb.exceptions.extract_traceback(tb, context=3))
         raise exc
     # Need to turn BaseExceptions into Exceptions here so we gracefully shutdown
     # and for example a worker thread doesn't just exit on its own in response to
@@ -1055,13 +1183,13 @@ class CookerParser(object):
         self.num_processes = int(self.cfgdata.getVar("BB_NUMBER_PARSE_THREADS", True) or
                                  multiprocessing.cpu_count())
 
-        self.bb_cache = bb.cache.Cache(self.cfgdata)
+        self.bb_cache = bb.cache.Cache(self.cfgdata, cooker.caches_array)
         self.fromcache = []
         self.willparse = []
         for filename in self.filelist:
             appends = self.cooker.get_file_appends(filename)
             if not self.bb_cache.cacheValid(filename):
-                self.willparse.append((filename, appends))
+                self.willparse.append((filename, appends, cooker.caches_array))
             else:
                 self.fromcache.append((filename, appends))
         self.toparse = self.total - len(self.fromcache)
@@ -1072,6 +1200,7 @@ class CookerParser(object):
     def start(self):
         def init(cfg):
             parse_file.cfg = cfg
+            multiprocessing.util.Finalize(None, bb.codeparser.parser_cache_save, args=(self.cooker.configuration.data, ), exitpriority=1)
 
         self.results = self.load_cached()
 
@@ -1098,11 +1227,10 @@ class CookerParser(object):
             self.pool.terminate()
         self.pool.join()
 
-        bb.codeparser.parser_cache_save(self.cfgdata)
-
         sync = threading.Thread(target=self.bb_cache.sync)
         sync.start()
         multiprocessing.util.Finalize(None, sync.join, exitpriority=-100)
+        bb.codeparser.parser_cache_savemerge(self.cooker.configuration.data)
 
     def load_cached(self):
         for filename, appends in self.fromcache:
@@ -1115,9 +1243,21 @@ class CookerParser(object):
         except StopIteration:
             self.shutdown()
             return False
-        except Exception as exc:
+        except ParsingFailure as exc:
             self.shutdown(clean=False)
-            bb.fatal('Error parsing %s: %s' % (exc.recipe, exc))
+            bb.fatal('Unable to parse %s: %s' %
+                     (exc.recipe, bb.exceptions.to_string(exc.realexception)))
+        except (bb.parse.ParseError, bb.data_smart.ExpansionError) as exc:
+            bb.fatal(str(exc))
+        except SyntaxError as exc:
+            logger.error('Unable to parse %s', exc.recipe)
+            sys.exit(1)
+        except Exception as exc:
+            etype, value, tb = sys.exc_info()
+            logger.error('Unable to parse %s', value.recipe,
+                         exc_info=(etype, value, exc.traceback))
+            self.shutdown(clean=False)
+            sys.exit(1)
 
         self.current += 1
         self.virtuals += len(result)
@@ -1129,17 +1269,17 @@ class CookerParser(object):
         else:
             self.cached += 1
 
-        for virtualfn, info in result:
-            if info.skipped:
+        for virtualfn, info_array in result:
+            if info_array[0].skipped:
                 self.skipped += 1
-            else:
-                self.bb_cache.add_info(virtualfn, info, self.cooker.status,
+                self.cooker.skiplist[virtualfn] = SkippedPackage(info_array[0])
+            self.bb_cache.add_info(virtualfn, info_array, self.cooker.status,
                                         parsed=parsed)
         return True
 
     def reparse(self, filename):
         infos = self.bb_cache.parse(filename,
                                     self.cooker.get_file_appends(filename),
-                                    self.cfgdata)
-        for vfn, info in infos:
-            self.cooker.status.add_from_recipeinfo(vfn, info)
+                                    self.cfgdata, self.cooker.caches_array)
+        for vfn, info_array in infos:
+            self.cooker.status.add_from_recipeinfo(vfn, info_array)

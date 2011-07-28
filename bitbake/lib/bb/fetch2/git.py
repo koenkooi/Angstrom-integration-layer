@@ -3,6 +3,41 @@
 """
 BitBake 'Fetch' git implementation
 
+git fetcher support the SRC_URI with format of:
+SRC_URI = "git://some.host/somepath;OptionA=xxx;OptionB=xxx;..."
+
+Supported SRC_URI options are:
+
+- branch
+   The git branch to retrieve from. The default is "master"
+
+   this option also support multiple branches fetching, branches
+   are seperated by comma. in multiple branches case, the name option
+   must have the same number of names to match the branches, which is
+   used to specify the SRC_REV for the branch
+   e.g:
+   SRC_URI="git://some.host/somepath;branch=branchX,branchY;name=nameX,nameY"
+   SRCREV_nameX = "xxxxxxxxxxxxxxxxxxxx"
+   SRCREV_nameY = "YYYYYYYYYYYYYYYYYYYY"
+
+- tag
+    The git tag to retrieve. The default is "master"
+
+- protocol
+   The method to use to access the repository. Common options are "git",
+   "http", "file" and "rsync". The default is "git"
+
+- rebaseable
+   rebaseable indicates that the upstream git repo may rebase in the future,
+   and current revision may disappear from upstream repo. This option will
+   reminder fetcher to preserve local cache carefully for future use.
+   The default value is "0", set rebaseable=1 for rebaseable git repo
+
+- nocheckout
+   Don't checkout source code when unpacking. set this option for the recipe
+   who has its own routine to checkout code.
+   The default is "0", set nocheckout=1 if needed.
+
 """
 
 #Copyright (C) 2005 Richard Purdie
@@ -51,11 +86,11 @@ class Git(FetchMethod):
         elif not ud.host:
             ud.proto = 'file'
         else:
-            ud.proto = "rsync"
+            ud.proto = "git"
 
-        ud.nocheckout = False
-        if 'nocheckout' in ud.parm:
-            ud.nocheckout = True
+        ud.nocheckout = ud.parm.get("nocheckout","0") == "1"
+
+        ud.rebaseable = ud.parm.get("rebaseable","0") == "1"
 
         branches = ud.parm.get("branch", "master").split(',')
         if len(branches) != len(ud.names):
@@ -65,19 +100,29 @@ class Git(FetchMethod):
             branch = branches[ud.names.index(name)]
             ud.branches[name] = branch
 
-        gitsrcname = '%s%s' % (ud.host, ud.path.replace('/', '.'))
-        ud.mirrortarball = 'git2_%s.tar.gz' % (gitsrcname)
-        ud.fullmirror = os.path.join(data.getVar("DL_DIR", d, True), ud.mirrortarball)
-        ud.clonedir = os.path.join(data.expand('${GITDIR}', d), gitsrcname)
-
         ud.basecmd = data.getVar("FETCHCMD_git", d, True) or "git"
+
+        ud.write_tarballs = ((data.getVar("BB_GENERATE_MIRROR_TARBALLS", d, True) or "0") != "0") or ud.rebaseable
+
+        ud.setup_revisons(d)
 
         for name in ud.names:
             # Ensure anything that doesn't look like a sha256 checksum/revision is translated into one
             if not ud.revisions[name] or len(ud.revisions[name]) != 40  or (False in [c in "abcdef0123456789" for c in ud.revisions[name]]):
+                ud.branches[name] = ud.revisions[name]
                 ud.revisions[name] = self.latest_revision(ud.url, ud, d, name)
 
-        ud.write_tarballs = (data.getVar("BB_GENERATE_MIRROR_TARBALLS", d, True) or "0") != "0"
+        gitsrcname = '%s%s' % (ud.host, ud.path.replace('/', '.'))
+        # for rebaseable git repo, it is necessary to keep mirror tar ball
+        # per revision, so that even the revision disappears from the
+        # upstream repo in the future, the mirror will remain intact and still
+        # contains the revision
+        if ud.rebaseable:
+            for name in ud.names:
+                gitsrcname = gitsrcname + '_' + ud.revisions[name]
+        ud.mirrortarball = 'git2_%s.tar.gz' % (gitsrcname)
+        ud.fullmirror = os.path.join(data.getVar("DL_DIR", d, True), ud.mirrortarball)
+        ud.clonedir = os.path.join(data.expand('${GITDIR}', d), gitsrcname)
 
         ud.localfile = ud.clonedir
 
@@ -122,8 +167,10 @@ class Git(FetchMethod):
 
         # If the repo still doesn't exist, fallback to cloning it
         if not os.path.exists(ud.clonedir):
-            bb.fetch2.check_network_access(d, "git clone --bare %s%s" % (ud.host, ud.path))
-            runfetchcmd("%s clone --bare %s://%s%s%s %s" % (ud.basecmd, ud.proto, username, ud.host, ud.path, ud.clonedir), d)
+            clone_cmd = "%s clone --bare %s://%s%s%s %s" % \
+                  (ud.basecmd, ud.proto, username, ud.host, ud.path, ud.clonedir)
+            bb.fetch2.check_network_access(d, clone_cmd)
+            runfetchcmd(clone_cmd, d)
 
         os.chdir(ud.clonedir)
         # Update the checkout if needed
@@ -132,7 +179,6 @@ class Git(FetchMethod):
             if not self._contains_ref(ud.revisions[name], d):
                 needupdate = True
         if needupdate:
-            bb.fetch2.check_network_access(d, "git fetch %s%s" % (ud.host, ud.path), ud.url)
             try: 
                 runfetchcmd("%s remote prune origin" % ud.basecmd, d) 
                 runfetchcmd("%s remote rm origin" % ud.basecmd, d) 
@@ -140,7 +186,9 @@ class Git(FetchMethod):
                 logger.debug(1, "No Origin")
             
             runfetchcmd("%s remote add origin %s://%s%s%s" % (ud.basecmd, ud.proto, username, ud.host, ud.path), d)
-            runfetchcmd("%s fetch --all -t" % ud.basecmd, d)
+            fetch_cmd = "%s fetch --all -t" % ud.basecmd
+            bb.fetch2.check_network_access(d, fetch_cmd, ud.url)
+            runfetchcmd(fetch_cmd, d)
             runfetchcmd("%s prune-packed" % ud.basecmd, d)
             runfetchcmd("%s pack-redundant --all | xargs -r rm" % ud.basecmd, d)
             ud.repochanged = True
@@ -168,8 +216,11 @@ class Git(FetchMethod):
         runfetchcmd("git clone -s -n %s %s" % (ud.clonedir, destdir), d)
         if not ud.nocheckout:
             os.chdir(destdir)
-            runfetchcmd("%s read-tree %s%s" % (ud.basecmd, ud.revisions[ud.names[0]], readpathspec), d)
-            runfetchcmd("%s checkout-index -q -f -a" % ud.basecmd, d)
+            if subdir != "":
+                runfetchcmd("%s read-tree %s%s" % (ud.basecmd, ud.revisions[ud.names[0]], readpathspec), d)
+                runfetchcmd("%s checkout-index -q -f -a" % ud.basecmd, d)
+            else:
+                runfetchcmd("%s checkout %s" % (ud.basecmd, ud.revisions[ud.names[0]]), d)
         return True
 
     def clean(self, ud, d):
@@ -201,9 +252,10 @@ class Git(FetchMethod):
         else:
             username = ""
 
-        bb.fetch2.check_network_access(d, "git ls-remote %s%s %s" % (ud.host, ud.path, ud.branches[name]))
         basecmd = data.getVar("FETCHCMD_git", d, True) or "git"
-        cmd = "%s ls-remote %s://%s%s%s %s" % (basecmd, ud.proto, username, ud.host, ud.path, ud.branches[name])
+        cmd = "%s ls-remote %s://%s%s%s %s" % \
+              (basecmd, ud.proto, username, ud.host, ud.path, ud.branches[name])
+        bb.fetch2.check_network_access(d, cmd)
         output = runfetchcmd(cmd, d, True)
         if not output:
             raise bb.fetch2.FetchError("The command %s gave empty output unexpectedly" % cmd, url)
@@ -223,10 +275,13 @@ class Git(FetchMethod):
         # Check if we have the rev already
 
         if not os.path.exists(ud.clonedir):
-            print("no repo")
+            logging.debug("GIT repository for %s does not exist in %s.  \
+                          Downloading.", url, ud.clonedir)
             self.download(None, ud, d)
             if not os.path.exists(ud.clonedir):
-                logger.error("GIT repository for %s doesn't exist in %s, cannot get sortable buildnumber, using old value", url, ud.clonedir)
+                logger.error("GIT repository for %s does not exist in %s after \
+                             download. Cannot get sortable buildnumber, using \
+                             old value", url, ud.clonedir)
                 return None
 
 

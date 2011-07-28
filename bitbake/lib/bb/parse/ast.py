@@ -100,7 +100,7 @@ class DataNode(AstNode):
         elif "colon" in groupd and groupd["colon"] != None:
             e = data.createCopy()
             bb.data.update_data(e)
-            val = bb.data.expand(groupd["value"], e)
+            val = bb.data.expand(groupd["value"], e, key + "[:=]")
         elif "append" in groupd and groupd["append"] != None:
             val = "%s %s" % ((self.getFunc(key, data) or ""), groupd["value"])
         elif "prepend" in groupd and groupd["prepend"] != None:
@@ -308,18 +308,21 @@ def handleInherit(statements, filename, lineno, m):
 
 def finalize(fn, d, variant = None):
     bb.data.expandKeys(d)
-    bb.data.update_data(d)
-    code = []
-    for funcname in bb.data.getVar("__BBANONFUNCS", d) or []:
-        code.append("%s(d)" % funcname)
-    bb.utils.simple_exec("\n".join(code), {"d": d})
-    bb.data.update_data(d)
 
     all_handlers = {}
     for var in bb.data.getVar('__BBHANDLERS', d) or []:
         # try to add the handler
         handler = bb.data.getVar(var, d)
         bb.event.register(var, handler)
+
+    bb.event.fire(bb.event.RecipePreFinalise(fn), d)
+
+    bb.data.update_data(d)
+    code = []
+    for funcname in bb.data.getVar("__BBANONFUNCS", d) or []:
+        code.append("%s(d)" % funcname)
+    bb.utils.simple_exec("\n".join(code), {"d": d})
+    bb.data.update_data(d)
 
     tasklist = bb.data.getVar('__BBTASKS', d) or []
     bb.build.add_tasks(tasklist, d)
@@ -369,12 +372,14 @@ def multi_finalize(fn, d):
         logger.debug(2, "Appending .bbappend file %s to %s", append, fn)
         bb.parse.BBHandler.handle(append, d, True)
 
+    onlyfinalise = d.getVar("__ONLYFINALISE", False)
+
     safe_d = d
     d = bb.data.createCopy(safe_d)
     try:
         finalize(fn, d)
-    except bb.parse.SkipPackage:
-        bb.data.setVar("__SKIPPED", True, d)
+    except bb.parse.SkipPackage as e:
+        bb.data.setVar("__SKIPPED", e.args[0], d)
     datastores = {"": safe_d}
 
     versions = (d.getVar("BBVERSIONS", True) or "").split()
@@ -416,8 +421,8 @@ def multi_finalize(fn, d):
             verfunc(pv, d, safe_d)
             try:
                 finalize(fn, d)
-            except bb.parse.SkipPackage:
-                bb.data.setVar("__SKIPPED", True, d)
+            except bb.parse.SkipPackage as e:
+                bb.data.setVar("__SKIPPED", e.args[0], d)
 
         _create_variants(datastores, versions, verfunc)
 
@@ -434,9 +439,10 @@ def multi_finalize(fn, d):
     for variant, variant_d in datastores.iteritems():
         if variant:
             try:
-                finalize(fn, variant_d, variant)
-            except bb.parse.SkipPackage:
-                bb.data.setVar("__SKIPPED", True, variant_d)
+                if not onlyfinalise or variant in onlyfinalise:
+                    finalize(fn, variant_d, variant)
+            except bb.parse.SkipPackage as e:
+                bb.data.setVar("__SKIPPED", e.args[0], variant_d)
 
     if len(datastores) > 1:
         variants = filter(None, datastores.iterkeys())

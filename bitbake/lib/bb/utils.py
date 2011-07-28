@@ -402,7 +402,7 @@ def fileslocked(files):
     for lock in locks:
         bb.utils.unlockfile(lock)
 
-def lockfile(name, shared=False):
+def lockfile(name, shared=False, retry=True):
     """
     Use the file fn as a lock file, return when the lock has been acquired.
     Returns a variable to pass to unlockfile().
@@ -418,6 +418,8 @@ def lockfile(name, shared=False):
     op = fcntl.LOCK_EX
     if shared:
         op = fcntl.LOCK_SH
+    if not retry:
+        op = op | fcntl.LOCK_NB
 
     while True:
         # If we leave the lockfiles lying around there is no problem
@@ -442,6 +444,8 @@ def lockfile(name, shared=False):
             lf.close()
         except Exception:
             continue
+        if not retry:
+            return None
 
 def unlockfile(lf):
     """
@@ -772,16 +776,23 @@ def copyfile(src, dest, newmtime = None, sstat = None):
             return False
 
     if stat.S_ISREG(sstat[stat.ST_MODE]):
-        os.chmod(src, stat.S_IRUSR) # Make sure we can read it
-        try: # For safety copy then move it over.
+        try:
+            srcchown = False
+            if not os.access(src, os.R_OK):
+                # Make sure we can read it
+                srcchown = True
+                os.chmod(src, sstat[stat.ST_MODE] | stat.S_IRUSR)
+
+            # For safety copy then move it over.
             shutil.copyfile(src, dest + "#new")
             os.rename(dest + "#new", dest)
         except Exception as e:
             print('copyfile: copy', src, '->', dest, 'failed.', e)
             return False
         finally:
-            os.chmod(src, sstat[stat.ST_MODE])
-            os.utime(src, (sstat[stat.ST_ATIME], sstat[stat.ST_MTIME]))
+            if srcchown:
+                os.chmod(src, sstat[stat.ST_MODE])
+                os.utime(src, (sstat[stat.ST_ATIME], sstat[stat.ST_MTIME]))
 
     else:
         #we don't yet handle special, so we need to fall back to /bin/mv

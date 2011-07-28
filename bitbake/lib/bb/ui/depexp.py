@@ -218,18 +218,13 @@ def main(server, eventHandler):
     gtk.gdk.threads_enter()
     dep = DepExplorer()
     pbar = ProgressBar(dep)
+    pbar.connect("delete-event", gtk.main_quit)
     gtk.gdk.threads_leave()
 
     progress_total = 0
     while True:
         try:
-            try:
-                # We must get nonblocking here, else we'll never check the
-                # quit signal
-                event = eventHandler.get(False, 0.25)
-            except Queue.Empty:
-                pass
-            
+            event = eventHandler.waitEvent(0.25)
             if gtkthread.quit.isSet():
                 server.runCommand(["stateStop"])
                 break
@@ -259,6 +254,8 @@ def main(server, eventHandler):
 
             if isinstance(event, bb.event.ParseStarted):
                 progress_total = event.total
+                if progress_total == 0:
+                    continue
                 gtk.gdk.threads_enter()
                 pbar.set_title("Processing recipes")
                 pbar.update(0, progress_total)

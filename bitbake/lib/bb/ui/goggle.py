@@ -30,12 +30,10 @@ import Queue
 def event_handle_idle_func (eventHandler, build, pbar):
 
     # Consume as many messages as we can in the time available to us
-    try:
-        while 1:
-            event = eventHandler.get(False)
-            build.handle_event (event, pbar)
-    except Queue.Empty:
-        pass
+    event = eventHandler.getEvent()
+    while event:
+        build.handle_event (event, pbar)
+        event = eventHandler.getEvent()
 
     return True
 
@@ -72,6 +70,7 @@ def main (server, eventHandler):
     window = MainWindow ()
     window.show_all ()
     pbar = ProgressBar(window)
+    pbar.connect("delete-event", gtk.main_quit)
 
     # Create the object for the current build
     running_build = RunningBuild ()

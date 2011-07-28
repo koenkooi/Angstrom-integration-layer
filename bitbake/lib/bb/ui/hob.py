@@ -28,6 +28,8 @@ import xmlrpclib
 import logging
 import Queue
 
+extraCaches = ['bb.cache_extra:HobRecipeInfo']
+
 class MainWindow (gtk.Window):
             
     def __init__(self, taskmodel, handler, curr_mach=None, curr_distro=None):
@@ -420,7 +422,7 @@ class MainWindow (gtk.Window):
         label.show()
         response = dialog.run()
         dialog.destroy()
-        if not response == gtk.RESPONSE_YES:
+        if response == gtk.RESPONSE_YES:
             self.handler.cancel_build()
         return
 

@@ -96,8 +96,9 @@ def main(server, eventHandler):
     return_value = 0
     while True:
         try:
-            event = eventHandler.get()
-
+            event = eventHandler.waitEvent(0.25)
+            if event is None:
+                continue
             helper.eventHandler(event)
             if isinstance(event, bb.runqueue.runQueueExitWait):
                 if not shutdown:
@@ -110,7 +111,7 @@ def main(server, eventHandler):
                         print("%s: %s (pid %s)" % (tasknum, activetasks[task]["title"], task))
 
             if isinstance(event, logging.LogRecord):
-                if event.levelno >= format.CRITICAL:
+                if event.levelno >= format.ERROR:
                     return_value = 1
                 # For "normal" logging conditions, don't show note logs from tasks
                 # but do show them if the user has changed the default log level to 
@@ -149,12 +150,17 @@ def main(server, eventHandler):
                 logger.info(event._message)
                 continue
             if isinstance(event, bb.event.ParseStarted):
+                if event.total == 0:
+                    continue
                 parseprogress = new_progress("Parsing recipes", event.total).start()
                 continue
             if isinstance(event, bb.event.ParseProgress):
                 parseprogress.update(event.current)
                 continue
             if isinstance(event, bb.event.ParseCompleted):
+                if not parseprogress:
+                    continue
+
                 parseprogress.finish()
                 print(("Parsing of %d .bb files complete (%d cached, %d parsed). %d targets, %d skipped, %d masked, %d errors."
                     % ( event.total, event.cached, event.parsed, event.virtuals, event.skipped, event.masked, event.errors)))
@@ -222,6 +228,7 @@ def main(server, eventHandler):
                                   bb.event.StampUpdate,
                                   bb.event.ConfigParsed,
                                   bb.event.RecipeParsed,
+                                  bb.event.RecipePreFinalise,
                                   bb.runqueue.runQueueEvent,
                                   bb.runqueue.runQueueExitWait)):
                 continue

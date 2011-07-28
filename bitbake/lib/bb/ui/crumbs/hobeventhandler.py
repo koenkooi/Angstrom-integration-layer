@@ -19,7 +19,6 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 import gobject
-import Queue
 from bb.ui.crumbs.progress import ProgressBar
 
 progress_total = 0
@@ -103,6 +102,8 @@ class HobHandler(gobject.GObject):
         elif isinstance(event, bb.event.CacheLoadCompleted) and pbar:
             pbar.update(bb.ui.crumbs.hobeventhandler.progress_total, bb.ui.crumbs.hobeventhandler.progress_total)
         elif isinstance(event, bb.event.ParseStarted) and pbar:
+            if event.total == 0:
+                return
             pbar.set_title("Processing recipes")
             bb.ui.crumbs.hobeventhandler.progress_total = event.total
             pbar.update(0, bb.ui.crumbs.hobeventhandler.progress_total)
@@ -115,19 +116,15 @@ class HobHandler(gobject.GObject):
 
     def event_handle_idle_func (self, eventHandler, running_build, pbar):
         # Consume as many messages as we can in the time available to us
-        while True:
-            try:
-                event = eventHandler.get(block=False)
-            except Queue.Empty:
-                break
-            else:
-                self.handle_event(event, running_build, pbar)
+        event = eventHandler.getEvent()
+        while event:
+            self.handle_event(event, running_build, pbar)
+            event = eventHandler.getEvent()
         return True
 
     def set_machine(self, machine):
         self.server.runCommand(["setVariable", "MACHINE", machine])
         self.current_command = "findConfigFilesMachine"
-        self.emit("generating-data")
         self.run_next_command()
 
     def set_distro(self, distro):
