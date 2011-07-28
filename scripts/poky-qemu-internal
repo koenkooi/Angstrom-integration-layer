@@ -75,7 +75,7 @@ if [ "$MACHINE" = "qemuarm" ]; then
     RAM=`echo $QEMU_MEMORY | sed 's/M$//'`
     if [[ -z "$RAM" || $RAM -gt 128 ]]; then
         echo "WARNING: qemuarm does not support > 128M of RAM."
-        echo "*** Changing QEMU_MEMORY to default of 128M ***"
+        echo "Changing QEMU_MEMORY to default of 128M."
         QEMU_MEMORY="128M"
         SCRIPT_QEMU_EXTRA_OPT=`echo $SCRIPT_QEMU_EXTRA_OPT | sed -e "s/$mem_set/-m 128/" `
     fi
@@ -102,7 +102,7 @@ acquire_lock() {
         # Check that the lockfile is not stale
         ps=`ps -ewwo pid | grep $(cat $lockfile.lock)`
         if [ -z "$ps" ]; then
-            echo "Warning: Stale lock file detected, deleting $lockfile.lock"
+            echo "WARNING: Stale lock file detected, deleting $lockfile.lock."
             rm -f $lockfile.lock
             echo $$ > $lockfile.lock
         else
@@ -268,13 +268,6 @@ if [ "$NFS_SERVER" = "" ]; then
 fi
 
 if [ "$MACHINE" = "qemuarm" -o "$MACHINE" = "qemuarmv6" -o "$MACHINE" = "qemuarmv7" ]; then
-    if [ -e /proc/sys/vm/mmap_min_addr ]; then
-        if [ `cat /proc/sys/vm/mmap_min_addr` != "0" ]; then
-            echo "Error, please set /proc/sys/vm/mmap_min_addr to 0 since otherwise it can cause problems with QEMU"
-            return
-        fi
-    fi
-
     QEMU=qemu-system-arm
     MACHINE_SUBTYPE=versatilepb
     QEMU_UI_OPTIONS="$QEMU_UI_OPTIONS"
@@ -316,6 +309,9 @@ if [ "$MACHINE" = "qemux86" ]; then
         KERNCMDLINE="root=/dev/nfs nfsroot=$NFS_SERVER:$NFS_DIR,$UNFS_OPTS rw $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
         QEMUOPTIONS="$QEMU_NETWORK_CMD $QEMU_UI_OPTIONS"
     fi
+    # Currently oprofile's event based interrupt mode doesn't work(Bug #828) in
+    # qemux86 and qemux86-64. We can use timer interrupt mode for now.
+    KERNCMDLINE="$KERNCMDLINE oprofile.timer=1"
 fi
 
 if [ "$MACHINE" = "qemux86-64" ]; then
@@ -337,6 +333,9 @@ if [ "$MACHINE" = "qemux86-64" ]; then
         KERNCMDLINE="root=/dev/nfs nfsroot=$NFS_SERVER:$NFS_DIR,$UNFS_OPTS rw $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
         QEMUOPTIONS="$QEMU_NETWORK_CMD $QEMU_UI_OPTIONS"
     fi
+    # Currently oprofile's event based interrupt mode doesn't work(Bug #828) in
+    # qemux86 and qemux86-64. We can use timer interrupt mode for now.
+    KERNCMDLINE="$KERNCMDLINE oprofile.timer=1"
 fi
 
 if [ "$MACHINE" = "spitz" ]; then
@@ -440,13 +439,26 @@ if [ -x "$DISTCCD" ]; then
     PIDFILE=`mktemp`
     $DISTCCD --allow 192.168.7.2 --daemon --pid-file $PIDFILE &
 else
-    echo "Warning: distccd not present, no distcc support loaded."
+    echo "WARNING: distccd not present, no distcc support loaded."
+fi
+
+# qemu got segfault if linked with nVidia's libgl
+if ldd $QEMUBIN | grep -i nvidia &> /dev/null
+then
+cat << EOM
+WARNING: nVidia proprietary OpenGL libraries detected.
+nVidia's OpenGL libraries are known to have compatibility issues with qemu,
+resulting in a segfault. Please uninstall these drivers or ensure the mesa libGL
+libraries precede nvidia's via LD_PRELOAD.
+EOM
 fi
 
 echo "Running $QEMU..."
 # -no-reboot is a mandatory option - see bug #100
 echo $QEMUBIN -kernel $KERNEL $QEMUOPTIONS $SERIALOPTS -no-reboot $SCRIPT_QEMU_OPT $SCRIPT_QEMU_EXTRA_OPT --append '"'$KERNCMDLINE $SCRIPT_KERNEL_OPT'"'
-$QEMUBIN -kernel $KERNEL $QEMUOPTIONS $SERIALOPTS -no-reboot $SCRIPT_QEMU_OPT $SCRIPT_QEMU_EXTRA_OPT --append "$KERNCMDLINE $SCRIPT_KERNEL_OPT" || /bin/true
+# If QEMU crashes, we need to run stty sane
+$QEMUBIN -kernel $KERNEL $QEMUOPTIONS $SERIALOPTS -no-reboot $SCRIPT_QEMU_OPT $SCRIPT_QEMU_EXTRA_OPT --append "$KERNCMDLINE $SCRIPT_KERNEL_OPT" || stty sane
+
 
 cleanup
 

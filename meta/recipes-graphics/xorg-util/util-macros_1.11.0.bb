@@ -11,7 +11,10 @@ PE = "1"
 PR = "r0"
 
 # ${PN} is empty so we need to tweak -dev and -dbg package dependencies
-DEPENDS = "gettext"
+DEPENDS = "gettext libgpg-error"
+DEPENDS_virtclass-native = "gettext"
+DEPENDS_virtclass-nativesdk = "gettext"
+
 RDEPENDS_${PN}-dev = ""
 RRECOMMENDS_${PN}-dbg = "${PN}-dev (= ${EXTENDPV})"
 

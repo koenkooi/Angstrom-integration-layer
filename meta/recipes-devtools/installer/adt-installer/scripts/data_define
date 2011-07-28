@@ -23,7 +23,7 @@
 # THE SOFTWARE.
 
 config_file="adt_installer.conf"
-source $config_file
+source `pwd`/$config_file
 
 LOCAL_OPKG_LOC="./opkg/build/opkg"
 LOCAL_OPKG_FOLDER="./opkg/build"
@@ -31,8 +31,8 @@ OPKG_LIBDIR="/var/lib"
 
 # List all supported root fs types and target types,
 # it will be used in user configuration validity checking
-YOCTOADT_SUPPORTED_ROOTFS="minimal sato sdk lsb"
-YOCTOADT_SUPPORTED_TARGETS="x86 x86_64 arm powerpc mips"
+YOCTOADT_SUPPORTED_ROOTFS="minimal minimal-dev sato sato-dev sato-sdk lsb lsb-dev lsb-sdk"
+YOCTOADT_SUPPORTED_TARGETS="x86 x86_64 arm ppc mips"
 # Different host (32 bit or 64 bit) will have different opkg
 # configuration files
 YOCTOADT_OPKG_CONF_FILE_32="./opkg/conf/opkg-sdk-i686.conf"

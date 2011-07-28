@@ -14,13 +14,14 @@ EXTRA_OEMAKE = "CROSS_COMPILE=${TARGET_PREFIX} OPTFLAGS='-O2'"
 UBOOT_MACHINE ?= "${MACHINE}_config"
 UBOOT_IMAGE ?= "u-boot-${MACHINE}-${PV}-${PR}.bin"
 UBOOT_SYMLINK ?= "u-boot-${MACHINE}.bin"
+UBOOT_MAKE_TARGET ?= "all"
 
 do_compile () {
 	unset LDFLAGS
 	unset CFLAGS
 	unset CPPFLAGS
 	oe_runmake ${UBOOT_MACHINE}
-	oe_runmake all
+	oe_runmake ${UBOOT_MAKE_TARGET}
 }
 
 do_deploy () {
@@ -31,8 +32,3 @@ do_deploy () {
 	ln -sf ${UBOOT_IMAGE} ${UBOOT_SYMLINK}
 }
 addtask deploy before do_build after do_compile
-
-do_install() {
-	install -d ${D}${bindir}
-	install -m 755 tools/mkimage ${D}${bindir}/
-}

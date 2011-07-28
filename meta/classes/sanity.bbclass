@@ -40,7 +40,26 @@ def check_sanity_tmpdir_change(tmpdir):
 def check_sanity_version_change():
     # Sanity checks to be done when SANITY_VERSION changes
     return ""
-    
+
+def check_pseudo_wrapper():
+    import subprocess as sub
+    # Check if bitbake wrapper is being used
+    pseudo_build = os.environ.get( 'PSEUDO_BUILD' )
+    if not pseudo_build:
+        bb.warn("Bitbake has not been run using the bitbake wrapper (scripts/bitbake); this is likely because your PATH has been altered from that normally set up by the poky-init-build-env script. Not using the wrapper may result in failures during package installation, so it is highly recommended that you set your PATH back so that the wrapper script is being executed.")
+
+    if (not pseudo_build) or pseudo_build == '2':
+        # pseudo ought to be working, let's see if it is...
+        p = sub.Popen(['sh', '-c', 'PSEUDO_DISABLED=0 id -u'],stdout=sub.PIPE,stderr=sub.PIPE)
+        out, err = p.communicate()
+        if out.rstrip() != '0':
+            msg = "Pseudo is not functioning correctly, which will cause failures during package installation. Please check your configuration."
+            if pseudo_build == '2':
+                return msg
+            else:
+                bb.warn(msg)
+    return ""
+
 def check_create_long_filename(filepath, pathname):
     testfile = os.path.join(filepath, ''.join([`num`[-1] for num in xrange(1,200)]))
     try:
@@ -170,10 +189,12 @@ def check_sanity(e):
         # This path is no longer user-readable in modern (very recent) Linux
         try:
             if os.path.exists("/proc/sys/vm/mmap_min_addr"):
-                f = file("/proc/sys/vm/mmap_min_addr", "r")
-                if (f.read().strip() != "0"):
-                        messages = messages + "/proc/sys/vm/mmap_min_addr is not 0. This will cause problems with qemu so please fix the value (as root).\n\nTo fix this in later reboots, set vm.mmap_min_addr = 0 in /etc/sysctl.conf.\n"
-                f.close()
+                f = open("/proc/sys/vm/mmap_min_addr", "r")
+                try:
+                    if (int(f.read().strip()) > 65536):
+                        messages = messages + "/proc/sys/vm/mmap_min_addr is not <= 65536. This will cause problems with qemu so please fix the value (as root).\n\nTo fix this in later reboots, set vm.mmap_min_addr = 65536 in /etc/sysctl.conf.\n"
+                finally:
+                    f.close()
         except:
             pass
 
@@ -184,6 +205,10 @@ def check_sanity(e):
     if missing != "":
         missing = missing.rstrip(',')
         messages = messages + "Please install following missing utilities: %s\n" % missing
+
+    pseudo_msg = check_pseudo_wrapper()
+    if pseudo_msg != "":
+        messages = messages + pseudo_msg + '\n'
 
     # Check if DISPLAY is set if IMAGETEST is set
     if not data.getVar( 'DISPLAY', e.data, True ) and data.getVar( 'IMAGETEST', e.data, True ) == 'qemu':
@@ -211,7 +236,7 @@ def check_sanity(e):
     nolibs = data.getVar('NO32LIBS', e.data, True)
     if not nolibs:
         lib32path = '/lib'
-        if os.path.exists('/lib64') and os.path.islink('/lib64'):
+        if os.path.exists('/lib64') and ( os.path.islink('/lib64') or os.path.islink('/lib') ):
            lib32path = '/lib32'
 
         if os.path.exists('%s/libc.so.6' % lib32path) and not os.path.exists('/usr/include/gnu/stubs-32.h'):
@@ -312,6 +337,19 @@ def check_sanity(e):
         messages = messages + "Error, you have an invalid character (+) in your POKYBASE directory path. Please move Poky to a directory which doesn't include a +."
     elif oeroot.find (' ') != -1:
         messages = messages + "Error, you have a space in your POKYBASE directory path. Please move Poky to a directory which doesn't include a space."
+
+    # Check that we don't have duplicate entries in PACKAGE_ARCHS
+    pkgarchs = data.getVar('PACKAGE_ARCHS', e.data, True)
+    seen = {}
+    dups = []
+
+    for pa in pkgarchs.split():
+    	if seen.get(pa, 0) == 1:
+	    dups.append(pa)
+	else:
+	    seen[pa] = 1
+    if len(dups):
+       messages = messages + "Error, the PACKAGE_ARCHS variable contains duplicates. The following archs are listed more than once: %s" % " ".join(dups)
 
     if messages != "":
         raise_sanity_error(messages)
