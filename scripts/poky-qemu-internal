@@ -1,0 +1,454 @@
+#!/bin/bash -x
+
+# Handle running Poky images under qemu
+#
+# Copyright (C) 2006-2008 OpenedHand Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+# Call setting:
+#   QEMU_MEMORY (optional) - set the amount of memory in the emualted system.
+#   SERIAL_LOGFILE (optional) - log the serial port output to a file
+#   CROSSPATH - the path to any cross toolchain to use with distcc
+#
+# Image options:
+#   MACHINE - the machine to run
+#   FSTYPE - the image type to run
+#   KERNEL - the kernel image file to use
+#   ROOTFS - the disk image file to use
+#
+
+
+mem_size=-1
+
+#Get rid of <> and get the contents of extra qemu running params
+SCRIPT_QEMU_EXTRA_OPT=`echo $SCRIPT_QEMU_EXTRA_OPT | sed -e 's/<//' -e 's/>//'`
+#if user set qemu memory, eg: -m 256 in qemu extra params, we need to do some 
+# validation check
+mem_set=`expr "$SCRIPT_QEMU_EXTRA_OPT" : '.*\(-m[[:space:]] *[0-9]*\)'`
+if [ ! -z "$mem_set" ] ; then
+#Get memory setting size from user input
+  mem_size=`echo $mem_set | sed 's/-m[[:space:]] *//'`
+fi
+
+if [ $mem_size -gt 0 ]; then
+  QEMU_MEMORY="$mem_size"M
+fi
+
+if [ -z "$QEMU_MEMORY" ]; then
+    case "$MACHINE" in
+        "qemux86")
+            QEMU_MEMORY="128M"
+            ;;
+        "qemux86-64")
+            QEMU_MEMORY="128M"
+            ;;
+        "qemuarm")
+            QEMU_MEMORY="128M"
+            ;;
+        "qemumips")
+            QEMU_MEMORY="128M"
+            ;;
+        "qemuppc")
+            QEMU_MEMORY="128M"
+            ;;
+        *)
+            QEMU_MEMORY="64M"
+            ;;
+    esac
+
+fi
+
+# Bug 433: qemuarm cannot use > 128 MB RAM
+if [ "$MACHINE" = "qemuarm" ]; then
+    RAM=`echo $QEMU_MEMORY | sed 's/M$//'`
+    if [[ -z "$RAM" || $RAM -gt 128 ]]; then
+        echo "WARNING: qemuarm does not support > 128M of RAM."
+        echo "*** Changing QEMU_MEMORY to default of 128M ***"
+        QEMU_MEMORY="128M"
+        SCRIPT_QEMU_EXTRA_OPT=`echo $SCRIPT_QEMU_EXTRA_OPT | sed -e "s/$mem_set/-m 128/" `
+    fi
+fi
+
+# This file is created when poky-gen-tapdevs creates a bank of tap
+# devices, indicating that the user should not bring up new ones using
+# sudo.
+NOSUDO_FLAG="/etc/poky-nosudo"
+
+QEMUIFUP=`which poky-qemu-ifup`
+QEMUIFDOWN=`which poky-qemu-ifdown`
+
+NFSRUNNING="false"
+
+acquire_lock() {
+    lockfile=$1
+    if [ -z "$lockfile" ]; then
+        echo "Error: missing lockfile arg passed to acquire_lock()"
+        return 1
+    fi
+
+    if [ -e "$lockfile.lock" ]; then
+        # Check that the lockfile is not stale
+        ps=`ps -ewwo pid | grep $(cat $lockfile.lock)`
+        if [ -z "$ps" ]; then
+            echo "Warning: Stale lock file detected, deleting $lockfile.lock"
+            rm -f $lockfile.lock
+            echo $$ > $lockfile.lock
+        else
+            return 1
+        fi
+    else
+        echo $$ > $lockfile.lock
+    fi
+
+    return 0
+}
+
+release_lock() {
+    lockfile=$1
+    if [ -z "$lockfile" ]; then
+        echo "Error: missing lockfile arg passed to release_lock()"
+        return 1
+    fi
+
+    rm -f $lockfile.lock
+}
+
+LOCKDIR="/tmp/qemu-tap-locks"
+if [ ! -d "$LOCKDIR" ]; then
+    mkdir $LOCKDIR
+    chmod 777 $LOCKDIR
+fi
+
+IFCONFIG=`which ifconfig`
+if [ -z "$IFCONFIG" ]; then
+    IFCONFIG=/sbin/ifconfig
+fi
+
+POSSIBLE=`$IFCONFIG -a | grep '^tap' | awk '{print $1}'`
+TAP=""
+LOCKFILE=""
+for tap in $POSSIBLE; do
+    LOCKFILE="$LOCKDIR/$tap"
+    echo "Acquiring lockfile for $tap..."
+    acquire_lock $LOCKFILE
+    if [ $? -eq 0 ]; then
+        TAP=$tap
+        break
+    fi
+done
+
+if [ "$TAP" = "" ]; then
+    if [ -e "$NOSUDO_FLAG" ]; then
+        echo "Error: There are no available tap devices to use for networking,"
+        echo "and I see $NOSUDO_FLAG exists, so I am not going to try creating"
+        echo "a new one with sudo."
+        exit 1
+    fi
+
+    GROUPID=`id -g`
+    echo "Setting up tap interface under sudo"
+    tap=`sudo $QEMUIFUP $GROUPID $POKY_NATIVE_SYSROOT`
+    if [ $? -ne 0 ]; then
+        # Re-run standalone to see verbose errors
+        sudo $QEMUIFUP $GROUPID $POKY_NATIVE_SYSROOT
+        return
+    fi
+    LOCKFILE="$LOCKDIR/$tap"
+    echo "Acquiring lockfile for $tap..."
+    acquire_lock $LOCKFILE
+    if [ $? -eq 0 ]; then
+        TAP=$tap
+    fi 
+else
+    echo "Using preconfigured tap device '$TAP'"
+fi
+
+cleanup() {
+    if [ ! -e "$NOSUDO_FLAG" ]; then
+        sudo $QEMUIFDOWN $TAP $POKY_NATIVE_SYSROOT
+    fi
+    echo "Releasing lockfile of preconfigured tap device '$TAP'"
+    release_lock $LOCKFILE
+
+    if [ "$NFSRUNNING" = "true" ]; then
+        echo "Shutting down the userspace NFS server..."
+        echo "poky-export-rootfs stop $ROOTFS"
+        poky-export-rootfs stop $ROOTFS
+    fi
+}
+
+n1=$[ (`echo $TAP | sed 's/tap//'` * 2) + 1 ]
+n2=$[ (`echo $TAP | sed 's/tap//'` * 2) + 2 ]
+
+KERNEL_NETWORK_CMD="ip=192.168.7.$n2::192.168.7.$n1:255.255.255.0"
+QEMU_TAP_CMD="-net tap,vlan=0,ifname=$TAP,script=no,downscript=no"
+QEMU_NETWORK_CMD="-net nic,vlan=0 $QEMU_TAP_CMD"
+KERNCMDLINE="mem=$QEMU_MEMORY"
+QEMU_UI_OPTIONS="-show-cursor -usb -usbdevice wacom-tablet"
+
+NFS_INSTANCE=`echo $TAP | sed 's/tap//'`
+export NFS_INSTANCE
+
+SERIALOPTS=""
+if [ "x$SERIAL_LOGFILE" != "x" ]; then
+    SERIALOPTS="-serial file:$SERIAL_LOGFILE"
+fi
+
+case "$MACHINE" in
+    "qemuarm") ;;
+    "qemumips") ;;
+    "qemuppc") ;;
+    "qemuarmv6") ;;
+    "qemuarmv7") ;;
+    "qemux86") ;;
+    "qemux86-64") ;;
+    "akita") ;;
+    "spitz") ;;
+    *)
+        echo "Error: Unsupported machine type $MACHINE"
+        return
+    ;;
+esac
+
+if [ ! -f "$KERNEL" ]; then
+    echo "Error: Kernel image file $KERNEL doesn't exist"
+    cleanup
+    return
+fi
+
+if [ "$FSTYPE" != "nfs" -a ! -f "$ROOTFS" ]; then
+    echo "Error: Image file $ROOTFS doesn't exist"
+    cleanup
+    return
+fi
+
+if [ "$FSTYPE" = "nfs" ]; then
+    NFS_SERVER="192.168.7.1"
+    NFS_DIR=`echo $ROOTFS | sed 's/^[^:]*:\(.*\)/\1/'`
+    MOUNTD_PORT=$[ 21111 + $NFS_INSTANCE ]
+    NFSD_PORT=$[ 11111 + $NFS_INSTANCE ]
+    UNFS_OPTS="nfsvers=2,mountprog=$MOUNTD_PORT,nfsprog=$NFSD_PORT,udp"
+
+    PSEUDO_LOCALSTATEDIR=~/.poky-sdk/pseudo
+    export PSEUDO_LOCALSTATEDIR
+
+    rpcbind_running=`ps ax | grep rpcbind | grep -v grep | wc -l`
+    portmap_running=`ps ax | grep portmap | grep -v grep | wc -l`
+    if [[ $rpcbind_running == 0 && $portmap_running == 0 ]]; then
+        echo "You need to be running either rpcbind or portmap to continue"
+        cleanup
+        return
+    fi
+
+    # Start the userspace NFS server
+    echo "poky-export-rootfs restart $ROOTFS"
+    poky-export-rootfs restart $ROOTFS
+    if [ $? != 0 ]; then
+        cleanup
+        return
+    fi
+    NFSRUNNING="true"
+fi
+
+if [ "$NFS_SERVER" = "" ]; then
+    NFS_SERVER="192.168.7.1"
+    NFS_DIR=$ROOTFS
+fi
+
+if [ "$MACHINE" = "qemuarm" -o "$MACHINE" = "qemuarmv6" -o "$MACHINE" = "qemuarmv7" ]; then
+    if [ -e /proc/sys/vm/mmap_min_addr ]; then
+        if [ `cat /proc/sys/vm/mmap_min_addr` != "0" ]; then
+            echo "Error, please set /proc/sys/vm/mmap_min_addr to 0 since otherwise it can cause problems with QEMU"
+            return
+        fi
+    fi
+
+    QEMU=qemu-system-arm
+    MACHINE_SUBTYPE=versatilepb
+    QEMU_UI_OPTIONS="$QEMU_UI_OPTIONS"
+    # QEMU_UI_OPTIONS="$QEMU_UI_OPTIONS -force-pointer"
+    if [ "$FSTYPE" = "ext3" ]; then
+        KERNCMDLINE="root=/dev/sda console=ttyAMA0,115200 console=tty $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY highres=off"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -M versatilepb -hda $ROOTFS -no-reboot $QEMU_UI_OPTIONS"
+    fi
+    if [ "$FSTYPE" = "nfs" ]; then
+        if [ "$NFS_SERVER" = "192.168.7.1" -a ! -d "$NFS_DIR" ]; then
+            echo "Error: NFS mount point $ROOTFS doesn't exist"
+            cleanup
+            return
+        fi
+        KERNCMDLINE="root=/dev/nfs nfsroot=$NFS_SERVER:$NFS_DIR,$UNFS_OPTS rw $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -M versatilepb --no-reboot $QEMU_UI_OPTIONS"
+    fi
+    if [ "$MACHINE" = "qemuarmv6" ]; then
+        QEMUOPTIONS="$QEMUOPTIONS -cpu arm1136"
+    fi
+    if [ "$MACHINE" = "qemuarmv7" ]; then
+        QEMUOPTIONS="$QEMUOPTIONS -cpu cortex-a8"
+    fi
+fi
+
+if [ "$MACHINE" = "qemux86" ]; then
+    QEMU=qemu
+    QEMU_UI_OPTIONS="$QEMU_UI_OPTIONS -vga vmware -enable-gl"
+    if [ "$FSTYPE" = "ext3" ]; then
+        KERNCMDLINE="vga=0 root=/dev/hda mem=$QEMU_MEMORY $KERNEL_NETWORK_CMD"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -hda $ROOTFS $QEMU_UI_OPTIONS"
+    fi
+    if [ "$FSTYPE" = "nfs" ]; then
+        if [ "$NFS_SERVER" = "192.168.7.1" -a ! -d "$NFS_DIR" ]; then
+            echo "Error: NFS mount point $ROOTFS doesn't exist."
+            cleanup
+            return
+        fi
+        KERNCMDLINE="root=/dev/nfs nfsroot=$NFS_SERVER:$NFS_DIR,$UNFS_OPTS rw $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD $QEMU_UI_OPTIONS"
+    fi
+fi
+
+if [ "$MACHINE" = "qemux86-64" ]; then
+    QEMU=qemu-system-x86_64
+    QEMU_UI_OPTIONS="$QEMU_UI_OPTIONS -vga vmware -enable-gl"
+    if [ "$FSTYPE" = "ext3" ]; then
+        KERNCMDLINE="vga=0 root=/dev/hda mem=$QEMU_MEMORY $KERNEL_NETWORK_CMD"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -hda $ROOTFS $QEMU_UI_OPTIONS"
+    fi
+    if [ "$FSTYPE" = "nfs" ]; then
+        if [ "x$ROOTFS" = "x" ]; then
+            ROOTFS=/srv/nfs/qemux86-64
+        fi
+        if [ ! -d "$ROOTFS" ]; then
+            echo "Error: NFS mount point $ROOTFS doesn't exist."
+            cleanup
+            return
+        fi
+        KERNCMDLINE="root=/dev/nfs nfsroot=$NFS_SERVER:$NFS_DIR,$UNFS_OPTS rw $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD $QEMU_UI_OPTIONS"
+    fi
+fi
+
+if [ "$MACHINE" = "spitz" ]; then
+    QEMU=qemu-system-arm
+    if [ "$FSTYPE" = "ext3" ]; then
+        echo $ROOTFS
+        ROOTFS=`readlink -f $ROOTFS`
+        echo $ROOTFS
+        if [ ! -e "$ROOTFS.qemudisk" ]; then
+            echo "Adding a partition table to the ext3 image for use by QEMU, please wait..."
+            poky-addptable2image $ROOTFS $ROOTFS.qemudisk
+        fi
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -M spitz -hda $ROOTFS.qemudisk -portrait"
+    fi
+fi
+
+if [ "$MACHINE" = "qemumips" ]; then
+    QEMU=qemu-system-mips
+    MACHINE_SUBTYPE=malta
+    QEMU_UI_OPTIONS="-vga cirrus $QEMU_UI_OPTIONS"
+    if [ "$FSTYPE" = "ext3" ]; then
+        #KERNCMDLINE="root=/dev/hda console=ttyS0 console=tty0 $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
+        KERNCMDLINE="root=/dev/hda console=ttyS0 console=tty $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -M $MACHINE_SUBTYPE -hda $ROOTFS -no-reboot $QEMU_UI_OPTIONS"
+    fi
+    if [ "$FSTYPE" = "nfs" ]; then
+        if [ "$NFS_SERVER" = "192.168.7.1" -a ! -d "$NFS_DIR" ]; then
+            echo "Error: NFS mount point $ROOTFS doesn't exist"
+            cleanup
+            return
+        fi
+        KERNCMDLINE="root=/dev/nfs console=ttyS0 console=tty nfsroot=$NFS_SERVER:$NFS_DIR,$UNFS_OPTS rw $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -M $MACHINE_SUBTYPE -no-reboot $QEMU_UI_OPTIONS"
+    fi
+fi
+
+if [ "$MACHINE" = "qemuppc" ]; then
+    QEMU=qemu-system-ppc
+    MACHINE_SUBTYPE=prep
+    CPU_SUBTYPE=603e
+    BIOS=powerpc_rom.bin
+    QEMU_UI_OPTIONS="$QEMU_UI_OPTIONS -nographic"
+    if [ "$FSTYPE" = "ext3" ]; then
+        KERNCMDLINE="root=/dev/hda console=ttyS0 console=tty0 $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -cpu $CPU_SUBTYPE -M $MACHINE_SUBTYPE -bios $BIOS -hda $ROOTFS -no-reboot $QEMU_UI_OPTIONS"
+    fi
+    if [ "$FSTYPE" = "nfs" ]; then
+        if [ "$NFS_SERVER" = "192.168.7.1" -a ! -d "$NFS_DIR" ]; then
+            echo "Error: NFS mount point $ROOTFS doesn't exist"
+            cleanup
+            return
+        fi
+        KERNCMDLINE="root=/dev/nfs console=ttyS0 console=tty0 nfsroot=$NFS_SERVER:$NFS_DIR,$UNFS_OPTS rw $KERNEL_NETWORK_CMD mem=$QEMU_MEMORY"
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -cpu $CPU_SUBTYPE -M $MACHINE_SUBTYPE -bios $BIOS -no-reboot $QEMU_UI_OPTIONS"
+    fi
+fi
+
+if [ "$MACHINE" = "akita" ]; then
+    QEMU=qemu-system-arm
+    if [ "$FSTYPE" = "jffs2" ]; then
+        ROOTFS=`readlink -f $ROOTFS`
+        if [ ! -e "$ROOTFS.qemuflash" ]; then
+            echo "Converting raw image into flash image format for use by QEMU, please wait..."
+        raw2flash.akita < $ROOTFS > $ROOTFS.qemuflash
+        fi
+        QEMUOPTIONS="$QEMU_NETWORK_CMD -M akita -mtdblock $ROOTFS.qemuflash -portrait"
+    fi
+fi
+
+if [ "x$QEMUOPTIONS" = "x" ]; then
+    echo "Error: Unable to support this combination of options"
+    cleanup
+    return
+fi
+
+PATH=$CROSSPATH:$POKY_NATIVE_SYSROOT/usr/bin:$PATH
+
+QEMUBIN=`which $QEMU`
+if [ ! -x "$QEMUBIN" ]; then
+    echo "Error: No QEMU binary '$QEMU' could be found."
+    cleanup
+    return
+fi
+
+function _quit() {
+    if [ -n "$PIDFILE" ]; then
+        #echo kill `cat $PIDFILE`
+        kill `cat $PIDFILE`
+    fi
+    cleanup
+    return
+}
+
+DISTCCD=`which distccd`
+PIDFILE=""
+
+trap _quit INT TERM QUIT
+
+if [ -x "$DISTCCD" ]; then
+    echo "Starting distccd..."
+    PIDFILE=`mktemp`
+    $DISTCCD --allow 192.168.7.2 --daemon --pid-file $PIDFILE &
+else
+    echo "Warning: distccd not present, no distcc support loaded."
+fi
+
+echo "Running $QEMU..."
+# -no-reboot is a mandatory option - see bug #100
+echo $QEMUBIN -kernel $KERNEL $QEMUOPTIONS $SERIALOPTS -no-reboot $SCRIPT_QEMU_OPT $SCRIPT_QEMU_EXTRA_OPT --append '"'$KERNCMDLINE $SCRIPT_KERNEL_OPT'"'
+$QEMUBIN -kernel $KERNEL $QEMUOPTIONS $SERIALOPTS -no-reboot $SCRIPT_QEMU_OPT $SCRIPT_QEMU_EXTRA_OPT --append "$KERNCMDLINE $SCRIPT_KERNEL_OPT" || /bin/true
+
+cleanup
+
+trap - INT TERM QUIT
+return

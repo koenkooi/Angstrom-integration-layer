@@ -1,0 +1,58 @@
+#!/bin/sh
+
+# Poky Build Enviroment Setup Script
+#
+# Copyright (C) 2006-2007 OpenedHand Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+# It is assumed OEROOT is already defined when this is called
+if [ -z "$OEROOT" ]; then
+    echo >&2 "Error: OEROOT is not defined!"
+    return
+fi
+
+if [ "x$BDIR" = "x" ]; then
+    if [ "x$1" = "x" ]; then
+        BDIR="build"
+    else
+        BDIR=`readlink -f "$1"`
+    fi
+fi
+if expr "$BDIR" : '/.*' > /dev/null ; then
+    BUILDDIR="$BDIR"
+else
+    BUILDDIR="`pwd`/$BDIR"
+fi
+unset BDIR
+
+BITBAKEDIR="$OEROOT/bitbake$BBEXTRA/"
+
+BITBAKEDIR=`readlink -f "$BITBAKEDIR"`
+BUILDDIR=`readlink -f "$BUILDDIR"`
+
+if ! (test -d "$BITBAKEDIR"); then
+    echo >&2 "Error: The bitbake directory ($BITBAKEDIR) does not exist!  Did you source the script in the poky directory?"
+    return
+fi
+
+PATH="${OEROOT}/scripts:$BITBAKEDIR/bin/:$PATH"
+unset BITBAKEDIR
+
+# Used by the poky-qemu script
+export BUILDDIR
+export PATH
+
+export BB_ENV_EXTRAWHITE="MACHINE DISTRO POKYMODE POKYLIBC http_proxy ftp_proxy https_proxy all_proxy ALL_PROXY no_proxy SSH_AGENT_PID SSH_AUTH_SOCK BB_SRCREV_POLICY SDKMACHINE BB_NUMBER_THREADS GIT_PROXY_COMMAND PSEUDO_DISABLED"

@@ -1,0 +1,53 @@
+#!/bin/sh
+NO_BUILD_OPTS="--version -h --help -p --parse-only -s --show-versions -e --environment"
+needpseudo="1"
+for opt in $@; do
+for key in $NO_BUILD_OPTS; do
+    if [ $opt = $key ]
+    then
+        needpseudo="0"
+        break
+    fi
+done
+[ $needpseudo = "0" ] && break
+done
+
+buildpseudo="1"
+if [ $needpseudo = "1" ] && [ -e "$BUILDDIR/pseudodone" ]; then
+    PSEUDOBINDIR=`cat $BUILDDIR/pseudodone`
+    if [ -e "$PSEUDOBINDIR/pseudo" -a -e "$PSEUDOBINDIR/tar" ]; then
+        buildpseudo="0"
+    fi
+fi
+if [ $needpseudo = "0" ]; then
+    buildpseudo="0"
+fi
+
+OLDPATH=$PATH
+export PATH=`echo $PATH | sed s#[^:]*/scripts:##`
+if [ $buildpseudo = "1" ]; then
+    echo "Pseudo is not present but is required, building this first before the main build"
+    bitbake pseudo-native tar-replacement-native -c populate_sysroot
+    ret=$?
+    if [ "$ret" != "0" ]; then
+        exit 1
+    fi
+    PSEUDOBINDIR=`bitbake -e | grep STAGING_BINDIR_NATIVE=\" | cut -d '=' -f2 | cut -d '"' -f2`
+    ret=$?
+    if [ "$ret" != "0" ]; then
+        exit 1
+    fi
+    echo $PSEUDOBINDIR > $BUILDDIR/pseudodone
+    # This needs to exist in case pseudo has to log somewhere
+    mkdir -p $PSEUDOBINDIR/../../var/pseudo
+fi
+BITBAKE=`which bitbake`
+export PATH=$OLDPATH
+if [ $needpseudo = "1" ]; then
+    PSEUDOBINDIR=`cat $BUILDDIR/pseudodone`
+    PSEUDO_BINDIR=$PSEUDOBINDIR PSEUDO_LIBDIR=$PSEUDOBINDIR/../lib/pseudo/lib PSEUDO_PREFIX=$PSEUDOBINDIR/../../ PSEUDO_DISABLED=1 $PSEUDOBINDIR/pseudo $BITBAKE $@
+else
+    $BITBAKE $@
+fi
+ret=$?
+exit $ret
